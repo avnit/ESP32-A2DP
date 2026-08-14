@@ -334,3 +334,19 @@ This software is totally free, but you can make me happy by rewarding me with a 
 - [Buy me a coffee](https://www.buymeacoffee.com/philschatzh)
 - [Paypal me](https://paypal.me/pschatzmann?country.x=CH&locale.x=en_US)
 
+<!-- ARCH-DIAGRAM:START -->
+
+## Architecture
+
+> Auto-generated architecture diagram. See [`docs/context-map.md`](docs/context-map.md) for the full context map (core application, containers/cloud, and database connections).
+
+```mermaid
+flowchart TD
+  User([User / Client])
+  UI["Frontend<br/>Next.js"]
+  App["ESP32-A2DP"]
+  User --> UI
+  User --> App
+```
+
+<!-- ARCH-DIAGRAM:END -->
