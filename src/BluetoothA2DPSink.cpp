@@ -243,7 +243,7 @@ esp_a2d_mct_t BluetoothA2DPSink::get_audio_type() { return audio_type; }
 void BluetoothA2DPSink::register_managed_decoder_seps() {
   uint8_t seid = 0;
   for (A2DPDecoder *dec : audio_decoder.all_decoders()) {
-    esp_a2d_mcc_t mcc = {0};
+    esp_a2d_mcc_t mcc = {};
     dec->build_capability(mcc);
     esp_err_t err = esp_a2d_sink_register_stream_endpoint(seid, &mcc);
     ESP_LOGI(BT_AV_TAG,
@@ -294,12 +294,16 @@ void BluetoothA2DPSink::managed_decode_flush() {
       esp_a2d_audio_buff_free(audio_buf);
     }
   }
-  // close the decoder while the task is still suspended, so it can't be
-  // concurrently mid-process() on the decoder being closed
-  audio_decoder.close();
   if (codec_decode_task_handle != nullptr) {
     vTaskResume(codec_decode_task_handle);
   }
+}
+
+void BluetoothA2DPSink::managed_decode_close() {
+  // suspend the task and drain the queue first, so it can't be concurrently
+  // mid-process() on the decoder being closed
+  managed_decode_flush();
+  audio_decoder.close();
 }
 
 void BluetoothA2DPSink::managed_decode_task_handler(void *arg) {
@@ -608,6 +612,15 @@ void BluetoothA2DPSink::av_hdl_a2d_evt(uint16_t event, void *p_param) {
       a2d = (esp_a2d_cb_param_t *)(p_param);
       if (ESP_A2D_INIT_SUCCESS == a2d->a2d_prof_stat.init_state) {
         ESP_LOGI(BT_AV_TAG, "A2DP PROF STATE: Init Compl\n");
+#if A2DP_MANAGED_DECODER_SUPPORTED
+        // stream endpoints must only be registered after the A2DP profile
+        // has finished initializing (this event), otherwise registration
+        // silently fails and the negotiation with the peer never opens the
+        // stream (ESP-IDF issue espressif/esp-idf#18786)
+        if (use_managed_decoder()) {
+          register_managed_decoder_seps();
+        }
+#endif
       } else {
         ESP_LOGI(BT_AV_TAG, "A2DP PROF STATE: Deinit Compl\n");
       }
@@ -777,6 +790,38 @@ void BluetoothA2DPSink::handle_audio_state(uint16_t event, void *p_param) {
 #endif
     set_i2s_active(true);
   } else if (ESP_A2D_AUDIO_STATE_SUSPEND == a2d->audio_stat.state) {
+#if A2DP_MANAGED_DECODER_SUPPORTED
+    // suspend the decode task *before* touching the output below: it runs
+    // on its own task (potentially on the other core) and keeps calling
+    // out->write() as long as it's not suspended, which can otherwise race
+    // with write_silence()/set_i2s_active(false) below and corrupt the I2S
+    // driver's internal spinlock state (observed as a
+    // "spinlock_acquire ... lock->count == 0" assertion on repeated
+    // pause/resume). managed_decode_flush() resumes it again once drained.
+    //
+    // vTaskSuspend() on a task currently running on the *other* core only
+    // requests a yield (via an inter-core interrupt) and returns
+    // immediately - it does not wait for that core to actually stop
+    // executing it. So we poll xTaskGetCurrentTaskHandleForCore() until the
+    // task is confirmed off both cores before proceeding, exactly like
+    // ESP-IDF's own xTaskCreateWithCaps()/vTaskDeleteWithCaps() do for the
+    // same reason (see idf_additions.c: prvTaskDeleteWithCaps()).
+    if (use_managed_decoder() && codec_decode_task_handle != nullptr) {
+      vTaskSuspend(codec_decode_task_handle);
+      for (;;) {
+        bool still_on_core = false;
+        for (BaseType_t core = 0; core < configNUMBER_OF_CORES; core++) {
+          if (xTaskGetCurrentTaskHandleForCore(core) ==
+              codec_decode_task_handle) {
+            still_on_core = true;
+            break;
+          }
+        }
+        if (!still_on_core) break;
+        taskYIELD();
+      }
+    }
+#endif
     // flush silence through DMA before deactivating to avoid a noise pop
     if (is_output && is_i2s_active) out->write_silence(2 * 1024);
     // deactivate only when is_output_active_by_state is true
@@ -837,7 +882,7 @@ void BluetoothA2DPSink::handle_connection_state(uint16_t event, void *p_param) {
       pin_code_request = Undefined;
 
 #if A2DP_MANAGED_DECODER_SUPPORTED
-      if (use_managed_decoder()) managed_decode_flush();
+      if (use_managed_decoder()) managed_decode_close();
 #endif
 
       // call callback
@@ -1176,15 +1221,6 @@ void BluetoothA2DPSink::av_hdl_stack_evt(uint16_t event, void* p_param) {
       if (esp_a2d_register_callback(ccall_app_a2d_callback) != ESP_OK) {
         ESP_LOGE(BT_AV_TAG, "esp_a2d_register_callback");
       }
-
-#if A2DP_MANAGED_DECODER_SUPPORTED
-      // register one stream endpoint per decoder added via add_decoder(),
-      // and decode whichever gets negotiated using the registered
-      // audio_tools decoders
-      if (use_managed_decoder()) {
-        register_managed_decoder_seps();
-      }
-#endif
 
       // Legacy decoded-data path: only used when the managed decoder path
       // (add_decoder()) is not active

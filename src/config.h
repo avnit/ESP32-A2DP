@@ -2,6 +2,17 @@
 
 #include "esp_idf_version.h"
 
+// Only the original ESP32 has the classic Bluetooth (BR/EDR) controller
+// that A2DP relies on - ESP32-S2/S3/C3/... only support BLE.
+#include "sdkconfig.h"
+#if defined(CONFIG_IDF_TARGET_ESP32)
+#  define IS_VALID_PLATFORM true
+#elif defined(CONFIG_IDF_TARGET_ESP32S31)
+#  define IS_VALID_PLATFORM true
+#else
+#  define IS_VALID_PLATFORM false
+#endif
+
 #ifndef AUTOCONNECT_TRY_NUM
 #  define AUTOCONNECT_TRY_NUM 1000
 #endif
@@ -34,7 +45,19 @@
 // (see A2DPDecoderAAC) - that is a runtime concern (reported via
 // ESP_A2D_SEP_REG_STATE_EVT), not a compile-time one.
 #ifndef A2DP_MANAGED_DECODER_SUPPORTED
-#  define A2DP_MANAGED_DECODER_SUPPORTED (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0) && A2DP_I2S_AUDIOTOOLS)
+#  define A2DP_MANAGED_DECODER_SUPPORTED (IS_VALID_PLATFORM && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0) && A2DP_I2S_AUDIOTOOLS)
+#endif
+
+// Managed multi-codec encode framework (A2DPEncoder/A2DPAudioEncoder) for
+// BluetoothA2DPSource: registers a stream endpoint per encoder added via
+// BluetoothA2DPSource::add_encoder() and encodes the PCM provided by the data
+// callbacks with the codec negotiated with the sink, using audio_tools
+// encoders (e.g. A2DPEncoderSBC, A2DPEncoderAAC). Same compile-time
+// requirements as the decoder framework; at runtime it additionally requires
+// CONFIG_BT_A2DP_USE_EXTERNAL_CODEC=y. If no encoder is added, the source
+// uses the legacy (internal ESP-IDF SBC encoder) data path unchanged.
+#ifndef A2DP_MANAGED_ENCODER_SUPPORTED
+#  define A2DP_MANAGED_ENCODER_SUPPORTED (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0) && A2DP_I2S_AUDIOTOOLS)
 #endif
 
 // Maximum write size
@@ -61,4 +84,35 @@
 
 #ifndef A2DP_MANAGED_DECODE_TASK_PRIO
 #  define A2DP_MANAGED_DECODE_TASK_PRIO (tskIDLE_PRIORITY + 5)
+#endif
+
+#ifndef A2DP_MANAGED_ENCODE_TASK_STACK
+#  define A2DP_MANAGED_ENCODE_TASK_STACK 8192
+#endif
+
+#ifndef A2DP_MANAGED_ENCODE_TASK_PRIO
+#  define A2DP_MANAGED_ENCODE_TASK_PRIO (tskIDLE_PRIORITY + 5)
+#endif
+
+// PCM bytes requested from the data callback per encode loop iteration
+#ifndef A2DP_MANAGED_ENCODE_CHUNK_SIZE
+#  define A2DP_MANAGED_ENCODE_CHUNK_SIZE 512
+#endif
+
+// How far (in ms) the encode task may run ahead of real time: the stack
+// only queues a limited number of packets, so the PCM is paced
+#ifndef A2DP_MANAGED_ENCODE_LEAD_MS
+#  define A2DP_MANAGED_ENCODE_LEAD_MS 100
+#endif
+
+// If the encode task falls behind real time by more than this (in ms), the
+// pacing is reset instead of trying to catch up with a burst
+#ifndef A2DP_MANAGED_ENCODE_MAX_LAG_MS
+#  define A2DP_MANAGED_ENCODE_MAX_LAG_MS 200
+#endif
+
+// Maximum time (in ms) to retry sending a packet while the stack's tx queue
+// is full, before the packet is dropped
+#ifndef A2DP_MANAGED_ENCODE_SEND_RETRY_MS
+#  define A2DP_MANAGED_ENCODE_SEND_RETRY_MS 100
 #endif
